@@ -1,0 +1,305 @@
+Automate EBS and LVM Resize with Ansible and Terraform
+
+Have you ever experienced the need to resize an EBS volume and did all or half of the steps manually? What if I told you, you don’t have to do anything manually now. Terraform and Ansible can do it all for you!
+Seriously, we all have experienced a flashing red light on our monitoring solutions notifying us that a partition will soon be 100% utilised. For myself personally, that meant either manually login to AWS console and modify the size of the affected disk, then login to the server and run few LVM commands to shift additional space where it needed to be, then resize the filesystem itself. This approach is fine when you have couple of servers to administer, but a nightmare when dealing with tens or hundreds. Even dealing with a couple of servers can certainly be time consuming.
+At my firm we have developed an automated way to deal with this dilemma automatically, sure we manually set the new size of an EBS volume, but that’s about all the manual tasks we do. We utilise Terraform to create hardware resources such as instances, EBS volumes and security groups. We do not utilise Terraform to login to our instances, for that we utilise Ansible. Ansible provisions LVM, formats disks and mounts volumes, and I’ll use such approach in this example.
+Creating Initial Hardware
+Here’s a minimal version of a Terraform project to create our demo instance and our demo EBS volume which we’ll be extending.
+resource "aws_instance" "instance" {
+  ami           = "ami-d2414e38"
+  instance_type = "t2.small"
+  subnet_id     = "subnet-126fa536"
+  key_name      = "secure_key_name"
+  vpc_security_group_ids = [
+    "sg-9ff51cee",
+  ]
+}
+resource "aws_ebs_volume" "demo_volume" {
+  size              = 10
+  availability_zone = "eu-west-1a"
+  type              = "standard"
+}
+resource "aws_volume_attachment" "attach_demo_volume" {
+  device_name  = "/dev/xvdg"
+  volume_id    = "${aws_ebs_volume.demo_volume.id}"
+  instance_id  = "${aws_instance.instance.id}"
+  skip_destroy = true
+}
+resource "aws_eip" "instance_ip" {
+  instance                  = "${aws_instance.instance.id}"
+  vpc                       = true
+  associate_with_private_ip = "${aws_instance.instance.private_ip}"
+}
+Configuring Initial Hardware
+The automation should be built so that it’s reusable and idempotent!
+The following Ansible playbook will provision attached drives according to correct variables.yml. In this case we have attached only one drive /dev/xvdg and we expect the playbook to create one LVM volume group vgdemo and out of the volume group we expect to have three LVM logical volumes lvconfig, lvdata1 and lvdata2 .
+lvconfig should end up with 1GB volume, lvdata1 with 20% of free space (minus 1GB taken by lvconfig) and lvdata2 with the rest of the free space. Weird I know, but that’s just to demonstrate the flexibility this can achieve!
+#!/usr/bin/env ansible-playbook
+---
+- hosts: all
+  user: ubuntu
+  become: true
+  vars_files:
+    - variables.yml
+  tasks:
+    - name: Create demo directories
+      file:
+        state: directory
+        path: "/mnt/{{ item }}"
+      with_items:
+        - config
+        - data1
+        - data2
+        
+    - name: Creating volume groups
+      lvg:
+        vg: "{{ item.key }}"
+        pvs: "{{ item.value.pvs|join(',') }}"
+        state: present
+      with_dict: "{{ lvm_config['vgs'] }}"
+      tags:
+        - lvm
+    - name: Conduct resize test of physical volumes
+      shell: "pvresize {{ item }} -v -t"
+      with_items: "{{ lvm_config['pvs'] }}"
+      changed_when: false
+      register: lvm_pvresize_output
+      tags:
+        - lvm
+        - resizefs
+    - name: Conduct resize test of physical volumes
+      shell: "pvresize {{ item.item }}"
+      when: '"No change to size of physical volume" not in item.stderr'
+      with_items: "{{ lvm_pvresize_output.results }}"
+      tags:
+        - lvm
+        - resizefs
+    - name: Creating/extending logical volumes
+      lvol:
+        lv: "{{ item.name }}"
+        vg: "{{ item.vg }}"
+        size: "{{ item.size }}"
+        opts: "{{ item.opts|default('') }}"
+        state: present
+      with_items: "{{ lvm_config['lvs'] }}"
+      tags:
+        - lvm
+        - resizefs
+    - name: Format filesystems
+      filesystem:
+        dev: "{{ item.value.dev }}"
+        fstype: "{{ item.value.type }}"
+        opts: "{{ item.value.opts }}"
+        resizefs: yes
+      with_dict: "{{ filesystems_config }}"
+      tags:
+        - filesystems
+        - resizefs
+    - name: Mount filesystems
+      mount:
+        src: "{{ item.value.dev }}"
+        name: "{{ item.value.mountpoint }}"
+        opts: "{{ item.value.opts }}"
+        fstype: "{{ item.value.fstype }}"
+        state: "{{ item.value.state }}"
+        passno: "{{ item.value.passno }}"
+        dump: "{{ item.value.dump }}"
+      with_dict: "{{ mounts_config }}"
+      tags:
+        - mounts
+...
+variables.yml to go with it.
+---
+lvm_config:
+    pvs:
+      - /dev/xvdg
+    vgs:
+        vgdemo:
+            pvs:
+                - /dev/xvdg
+    lvs:
+        - name: lvconfig
+          vg: vgdemo
+          size: 1G
+        - name: lvdata1
+          vg: vgdemo
+          size: "+20%FREE"
+        - name: lvdata2
+          vg: vgdemo
+          size: "+100%FREE"
+filesystems_config:
+    config:
+        dev: /dev/vgdemo/lvconfig
+        type: ext4
+        opts: ''
+    data1:
+        dev: /dev/vgdemo/lvdata1
+        type: ext4
+        opts: ''
+    data2:
+        dev: /dev/vgdemo/lvdata2
+        type: ext4
+        opts: ''
+mounts_config:
+    config:
+        dev: /dev/vgdemo/lvconfig
+        fstype: ext4
+        opts: 'noatime,nodiratime'
+        mountpoint: /mnt/config
+        dump: '0'
+        passno: '2'
+        state: mounted
+    data1:
+        dev: /dev/vgdemo/lvdata1
+        fstype: ext4
+        opts: 'noatime,nodiratime'
+        mountpoint: /mnt/data1
+        dump: '0'
+        passno: '2'
+        state: mounted
+    data2:
+        dev: /dev/vgdemo/lvdata2
+        fstype: ext4
+        opts: 'noatime,nodiratime'
+        mountpoint: /mnt/data2
+        dump: '0'
+        passno: '2'
+        state: mounted
+...
+The result after the initial run on the fresh instance is the following:
+ubuntu@demo_instance:~$ df -h
+Filesystem                   Size  Used Avail Use% Mounted on
+udev                         985M     0  985M   0% /dev
+tmpfs                        200M  740K  199M   1% /run
+/dev/xvda1                   7.7G  1.1G  6.7G  14% /
+tmpfs                        996M     0  996M   0% /dev/shm
+tmpfs                        5.0M     0  5.0M   0% /run/lock
+tmpfs                        996M     0  996M   0% /sys/fs/cgroup
+/dev/loop0                    87M   87M     0 100% /snap/core/4650
+/dev/loop1                    13M   13M     0 100% /snap/amazon-ssm-agent/295
+/dev/mapper/vgdemo-lvconfig  976M  2.6M  907M   1% /mnt/config
+/dev/mapper/vgdemo-lvdata1   1.8G  5.4M  1.7G   1% /mnt/data1
+/dev/mapper/vgdemo-lvdata2   7.1G   33M  6.7G   1% /mnt/data2
+tmpfs                        200M     0  200M   0% /run/user/1000
+Ansible stdout if you want to read it through:
+...
+PLAY [all] *********************************************************************
+TASK [Gathering Facts] *********************************************************
+ok: [34.246.241.182]
+META: ran handlers
+TASK [Create demo directories] *************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:10
+changed: [34.246.241.182] => (item=config) => {"changed": true, "failed": false, "gid": 0, "group": "root", "item": "config", "mode": "0755", "owner": "root", "path": "/mnt/config", "size": 4096, "state": "directory", "uid": 0}
+changed: [34.246.241.182] => (item=data1) => {"changed": true, "failed": false, "gid": 0, "group": "root", "item": "data1", "mode": "0755", "owner": "root", "path": "/mnt/data1", "size": 4096, "state": "directory", "uid": 0}
+changed: [34.246.241.182] => (item=data2) => {"changed": true, "failed": false, "gid": 0, "group": "root", "item": "data2", "mode": "0755", "owner": "root", "path": "/mnt/data2", "size": 4096, "state": "directory", "uid": 0}
+TASK [Creating volume groups] **************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:19
+changed: [34.246.241.182] => (item={'value': {u'pvs': [u'/dev/xvdg']}, 'key': u'vgdemo'}) => {"changed": true, "failed": false, "item": {"key": "vgdemo", "value": {"pvs": ["/dev/xvdg"]}}}
+TASK [Conduct resize test of physical volumes] *********************************
+task path: /ansible/blog_automated_ebs_volumes.yml:28
+ok: [34.246.241.182] => (item=/dev/xvdg) => {"changed": false, "cmd": "pvresize /dev/xvdg -v -t", "delta": "0:00:00.174493", "end": "2018-07-10 18:01:55.735657", "failed": false, "item": "/dev/xvdg", "rc": 0, "start": "2018-07-10 18:01:55.561164", "stderr": "  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.\n    Wiping internal VG cache\n    Wiping cache of LVM-capable devices\n    Test mode: Skipping archiving of volume group.\n    Resizing volume \"/dev/xvdg\" to 20971520 sectors.\n    No change to size of physical volume /dev/xvdg.\n    Updating physical volume \"/dev/xvdg\"\n    Test mode: Skipping backup of volume group.\n    Test mode: Wiping internal cache\n    Wiping internal VG cache", "stderr_lines": ["  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.", "    Wiping internal VG cache", "    Wiping cache of LVM-capable devices", "    Test mode: Skipping archiving of volume group.", "    Resizing volume \"/dev/xvdg\" to 20971520 sectors.", "    No change to size of physical volume /dev/xvdg.", "    Updating physical volume \"/dev/xvdg\"", "    Test mode: Skipping backup of volume group.", "    Test mode: Wiping internal cache", "    Wiping internal VG cache"], "stdout": "  Physical volume \"/dev/xvdg\" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized", "stdout_lines": ["  Physical volume \"/dev/xvdg\" changed", "  1 physical volume(s) resized / 0 physical volume(s) not resized"]}
+TASK [Conduct resize test of physical volumes] *********************************
+task path: /ansible/blog_automated_ebs_volumes.yml:37
+skipping: [34.246.241.182] => (item={'_ansible_parsed': True, 'stderr_lines': [u'  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.', u'    Wiping internal VG cache', u'    Wiping cache of LVM-capable devices', u'    Test mode: Skipping archiving of volume group.', u'    Resizing volume "/dev/xvdg" to 20971520 sectors.', u'    No change to size of physical volume /dev/xvdg.', u'    Updating physical volume "/dev/xvdg"', u'    Test mode: Skipping backup of volume group.', u'    Test mode: Wiping internal cache', u'    Wiping internal VG cache'], '_ansible_item_result': True, u'end': u'2018-07-10 18:01:55.735657', '_ansible_no_log': False, u'stdout': u'  Physical volume "/dev/xvdg" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized', u'cmd': u'pvresize /dev/xvdg -v -t', u'rc': 0, 'item': u'/dev/xvdg', u'delta': u'0:00:00.174493', u'stderr': u'  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.\n    Wiping internal VG cache\n    Wiping cache of LVM-capable devices\n    Test mode: Skipping archiving of volume group.\n    Resizing volume "/dev/xvdg" to 20971520 sectors.\n    No change to size of physical volume /dev/xvdg.\n    Updating physical volume "/dev/xvdg"\n    Test mode: Skipping backup of volume group.\n    Test mode: Wiping internal cache\n    Wiping internal VG cache', u'changed': False, u'invocation': {u'module_args': {u'creates': None, u'executable': None, u'_uses_shell': True, u'_raw_params': u'pvresize /dev/xvdg -v -t', u'removes': None, u'warn': True, u'chdir': None, u'stdin': None}}, 'stdout_lines': [u'  Physical volume "/dev/xvdg" changed', u'  1 physical volume(s) resized / 0 physical volume(s) not resized'], u'start': u'2018-07-10 18:01:55.561164', '_ansible_ignore_errors': None, 'failed': False})  => {"changed": false, "item": {"changed": false, "cmd": "pvresize /dev/xvdg -v -t", "delta": "0:00:00.174493", "end": "2018-07-10 18:01:55.735657", "failed": false, "invocation": {"module_args": {"_raw_params": "pvresize /dev/xvdg -v -t", "_uses_shell": true, "chdir": null, "creates": null, "executable": null, "removes": null, "stdin": null, "warn": true}}, "item": "/dev/xvdg", "rc": 0, "start": "2018-07-10 18:01:55.561164", "stderr": "  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.\n    Wiping internal VG cache\n    Wiping cache of LVM-capable devices\n    Test mode: Skipping archiving of volume group.\n    Resizing volume \"/dev/xvdg\" to 20971520 sectors.\n    No change to size of physical volume /dev/xvdg.\n    Updating physical volume \"/dev/xvdg\"\n    Test mode: Skipping backup of volume group.\n    Test mode: Wiping internal cache\n    Wiping internal VG cache", "stderr_lines": ["  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.", "    Wiping internal VG cache", "    Wiping cache of LVM-capable devices", "    Test mode: Skipping archiving of volume group.", "    Resizing volume \"/dev/xvdg\" to 20971520 sectors.", "    No change to size of physical volume /dev/xvdg.", "    Updating physical volume \"/dev/xvdg\"", "    Test mode: Skipping backup of volume group.", "    Test mode: Wiping internal cache", "    Wiping internal VG cache"], "stdout": "  Physical volume \"/dev/xvdg\" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized", "stdout_lines": ["  Physical volume \"/dev/xvdg\" changed", "  1 physical volume(s) resized / 0 physical volume(s) not resized"]}, "skip_reason": "Conditional result was False", "skipped": true}
+TASK [Creating/extending logical volumes] **************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:45
+changed: [34.246.241.182] => (item={u'vg': u'vgdemo', u'name': u'lvconfig', u'size': u'1G'}) => {"changed": true, "failed": false, "item": {"name": "lvconfig", "size": "1G", "vg": "vgdemo"}, "msg": ""}
+changed: [34.246.241.182] => (item={u'vg': u'vgdemo', u'name': u'lvdata1', u'size': u'+20%FREE'}) => {"changed": true, "failed": false, "item": {"name": "lvdata1", "size": "+20%FREE", "vg": "vgdemo"}, "msg": ""}
+changed: [34.246.241.182] => (item={u'vg': u'vgdemo', u'name': u'lvdata2', u'size': u'+100%FREE'}) => {"changed": true, "failed": false, "item": {"name": "lvdata2", "size": "+100%FREE", "vg": "vgdemo"}, "msg": ""}
+TASK [Format filesystems] ******************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:57
+changed: [34.246.241.182] => (item={'value': {u'type': u'ext4', u'dev': u'/dev/vgdemo/lvconfig', u'opts': u''}, 'key': u'config'}) => {"changed": true, "failed": false, "item": {"key": "config", "value": {"dev": "/dev/vgdemo/lvconfig", "opts": "", "type": "ext4"}}}
+changed: [34.246.241.182] => (item={'value': {u'type': u'ext4', u'dev': u'/dev/vgdemo/lvdata1', u'opts': u''}, 'key': u'data1'}) => {"changed": true, "failed": false, "item": {"key": "data1", "value": {"dev": "/dev/vgdemo/lvdata1", "opts": "", "type": "ext4"}}}
+changed: [34.246.241.182] => (item={'value': {u'type': u'ext4', u'dev': u'/dev/vgdemo/lvdata2', u'opts': u''}, 'key': u'data2'}) => {"changed": true, "failed": false, "item": {"key": "data2", "value": {"dev": "/dev/vgdemo/lvdata2", "opts": "", "type": "ext4"}}}
+TASK [Mount filesystems] *******************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:68
+changed: [34.246.241.182] => (item={'value': {u'dump': u'0', u'passno': u'2', u'dev': u'/dev/vgdemo/lvconfig', u'fstype': u'ext4', u'state': u'mounted', u'mountpoint': u'/mnt/config', u'opts': u'noatime,nodiratime'}, 'key': u'config'}) => {"changed": true, "dump": "0", "failed": false, "fstab": "/etc/fstab", "fstype": "ext4", "item": {"key": "config", "value": {"dev": "/dev/vgdemo/lvconfig", "dump": "0", "fstype": "ext4", "mountpoint": "/mnt/config", "opts": "noatime,nodiratime", "passno": "2", "state": "mounted"}}, "name": "/mnt/config", "opts": "noatime,nodiratime", "passno": "2", "src": "/dev/vgdemo/lvconfig"}
+changed: [34.246.241.182] => (item={'value': {u'dump': u'0', u'passno': u'2', u'dev': u'/dev/vgdemo/lvdata1', u'fstype': u'ext4', u'state': u'mounted', u'mountpoint': u'/mnt/data1', u'opts': u'noatime,nodiratime'}, 'key': u'data1'}) => {"changed": true, "dump": "0", "failed": false, "fstab": "/etc/fstab", "fstype": "ext4", "item": {"key": "data1", "value": {"dev": "/dev/vgdemo/lvdata1", "dump": "0", "fstype": "ext4", "mountpoint": "/mnt/data1", "opts": "noatime,nodiratime", "passno": "2", "state": "mounted"}}, "name": "/mnt/data1", "opts": "noatime,nodiratime", "passno": "2", "src": "/dev/vgdemo/lvdata1"}
+changed: [34.246.241.182] => (item={'value': {u'dump': u'0', u'passno': u'2', u'dev': u'/dev/vgdemo/lvdata2', u'fstype': u'ext4', u'state': u'mounted', u'mountpoint': u'/mnt/data2', u'opts': u'noatime,nodiratime'}, 'key': u'data2'}) => {"changed": true, "dump": "0", "failed": false, "fstab": "/etc/fstab", "fstype": "ext4", "item": {"key": "data2", "value": {"dev": "/dev/vgdemo/lvdata2", "dump": "0", "fstype": "ext4", "mountpoint": "/mnt/data2", "opts": "noatime,nodiratime", "passno": "2", "state": "mounted"}}, "name": "/mnt/data2", "opts": "noatime,nodiratime", "passno": "2", "src": "/dev/vgdemo/lvdata2"}
+META: ran handlers
+META: ran handlers
+PLAY RECAP *********************************************************************
+34.246.241.182             : ok=7    changed=5    unreachable=0    failed=0
+Extending Disk
+Now let’s say we’ll extend the disk to a new required size of 200GB, and apply the changes with Terraform.
+...
+resource "aws_ebs_volume" "demo_volume" {
+  # changed from 10 to 200
+  size              = 200
+  availability_zone = "eu-west-1b"
+  type              = "standard"
+}
+...
+Terraform stdout of extending the EBS volume.
+An execution plan has been generated and is shown below.
+Resource actions are indicated with the following symbols:
+  ~ update in-place
+Terraform will perform the following actions:
+  ~ aws_ebs_volume.demo_volume
+      size: "10" => "200"
+Plan: 0 to add, 1 to change, 0 to destroy.
+Do you want to perform these actions?
+  Terraform will perform the actions described above.
+  Only 'yes' will be accepted to approve.
+  Enter a value: yes
+aws_ebs_volume.demo_volume: Modifying... (ID: vol-0f52361625e68a692aaff
+aws_ebs_volume.demo_volume: Still modifying... (ID: vol-0f52361625e68a692aaff, 10s elapsed)
+aws_ebs_volume.demo_volume: Modifications complete after 12s (ID: vol-0f52361625e68a692aaff)
+Apply complete! Resources: 0 added, 1 changed, 0 destroyed.
+Resizing Filesystem
+Without a change to the Ansible variables we’ll end up with extended LVM and filesystems. Below is Ansible stdout from the second run of the playbook.
+...
+PLAY [all] *********************************************************************
+TASK [Gathering Facts] *********************************************************
+ok: [34.246.241.182]
+META: ran handlers
+TASK [Create demo directories] *************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:10
+ok: [34.246.241.182] => (item=config) => {"changed": false, "failed": false, "gid": 0, "group": "root", "item": "config", "mode": "0755", "owner": "root", "path": "/mnt/config", "size": 4096, "state": "directory", "uid": 0}
+ok: [34.246.241.182] => (item=data1) => {"changed": false, "failed": false, "gid": 0, "group": "root", "item": "data1", "mode": "0755", "owner": "root", "path": "/mnt/data1", "size": 4096, "state": "directory", "uid": 0}
+ok: [34.246.241.182] => (item=data2) => {"changed": false, "failed": false, "gid": 0, "group": "root", "item": "data2", "mode": "0755", "owner": "root", "path": "/mnt/data2", "size": 4096, "state": "directory", "uid": 0}
+TASK [Creating volume groups] **************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:19
+ok: [34.246.241.182] => (item={'value': {u'pvs': [u'/dev/xvdg']}, 'key': u'vgdemo'}) => {"changed": false, "failed": false, "item": {"key": "vgdemo", "value": {"pvs": ["/dev/xvdg"]}}}
+TASK [Conduct resize test of physical volumes] *********************************
+task path: /ansible/blog_automated_ebs_volumes.yml:28
+ok: [34.246.241.182] => (item=/dev/xvdg) => {"changed": false, "cmd": "pvresize /dev/xvdg -v -t", "delta": "0:00:00.039177", "end": "2018-07-10 18:38:57.322731", "failed": false, "item": "/dev/xvdg", "rc": 0, "start": "2018-07-10 18:38:57.283554", "stderr": "  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.\n    Wiping internal VG cache\n    Wiping cache of LVM-capable devices\n    Test mode: Skipping archiving of volume group.\n    Resizing volume \"/dev/xvdg\" to 419430400 sectors.\n    Resizing physical volume /dev/xvdg from 2559 to 51199 extents.\n    Updating physical volume \"/dev/xvdg\"\n    Test mode: Skipping backup of volume group.\n    Test mode: Wiping internal cache\n    Wiping internal VG cache", "stderr_lines": ["  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.", "    Wiping internal VG cache", "    Wiping cache of LVM-capable devices", "    Test mode: Skipping archiving of volume group.", "    Resizing volume \"/dev/xvdg\" to 419430400 sectors.", "    Resizing physical volume /dev/xvdg from 2559 to 51199 extents.", "    Updating physical volume \"/dev/xvdg\"", "    Test mode: Skipping backup of volume group.", "    Test mode: Wiping internal cache", "    Wiping internal VG cache"], "stdout": "  Physical volume \"/dev/xvdg\" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized", "stdout_lines": ["  Physical volume \"/dev/xvdg\" changed", "  1 physical volume(s) resized / 0 physical volume(s) not resized"]}
+TASK [Conduct resize test of physical volumes] *********************************
+task path: /ansible/blog_automated_ebs_volumes.yml:37
+changed: [34.246.241.182] => (item={'_ansible_parsed': True, 'stderr_lines': [u'  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.', u'    Wiping internal VG cache', u'    Wiping cache of LVM-capable devices', u'    Test mode: Skipping archiving of volume group.', u'    Resizing volume "/dev/xvdg" to 419430400 sectors.', u'    Resizing physical volume /dev/xvdg from 2559 to 51199 extents.', u'    Updating physical volume "/dev/xvdg"', u'    Test mode: Skipping backup of volume group.', u'    Test mode: Wiping internal cache', u'    Wiping internal VG cache'], '_ansible_item_result': True, u'end': u'2018-07-10 18:38:57.322731', '_ansible_no_log': False, u'stdout': u'  Physical volume "/dev/xvdg" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized', u'cmd': u'pvresize /dev/xvdg -v -t', u'rc': 0, 'item': u'/dev/xvdg', u'delta': u'0:00:00.039177', u'stderr': u'  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.\n    Wiping internal VG cache\n    Wiping cache of LVM-capable devices\n    Test mode: Skipping archiving of volume group.\n    Resizing volume "/dev/xvdg" to 419430400 sectors.\n    Resizing physical volume /dev/xvdg from 2559 to 51199 extents.\n    Updating physical volume "/dev/xvdg"\n    Test mode: Skipping backup of volume group.\n    Test mode: Wiping internal cache\n    Wiping internal VG cache', u'changed': False, u'invocation': {u'module_args': {u'creates': None, u'executable': None, u'_uses_shell': True, u'_raw_params': u'pvresize /dev/xvdg -v -t', u'removes': None, u'warn': True, u'chdir': None, u'stdin': None}}, 'stdout_lines': [u'  Physical volume "/dev/xvdg" changed', u'  1 physical volume(s) resized / 0 physical volume(s) not resized'], u'start': u'2018-07-10 18:38:57.283554', '_ansible_ignore_errors': None, 'failed': False}) => {"changed": true, "cmd": "pvresize /dev/xvdg", "delta": "0:00:00.085751", "end": "2018-07-10 18:38:58.182065", "failed": false, "item": {"changed": false, "cmd": "pvresize /dev/xvdg -v -t", "delta": "0:00:00.039177", "end": "2018-07-10 18:38:57.322731", "failed": false, "invocation": {"module_args": {"_raw_params": "pvresize /dev/xvdg -v -t", "_uses_shell": true, "chdir": null, "creates": null, "executable": null, "removes": null, "stdin": null, "warn": true}}, "item": "/dev/xvdg", "rc": 0, "start": "2018-07-10 18:38:57.283554", "stderr": "  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.\n    Wiping internal VG cache\n    Wiping cache of LVM-capable devices\n    Test mode: Skipping archiving of volume group.\n    Resizing volume \"/dev/xvdg\" to 419430400 sectors.\n    Resizing physical volume /dev/xvdg from 2559 to 51199 extents.\n    Updating physical volume \"/dev/xvdg\"\n    Test mode: Skipping backup of volume group.\n    Test mode: Wiping internal cache\n    Wiping internal VG cache", "stderr_lines": ["  TEST MODE: Metadata will NOT be updated and volumes will not be (de)activated.", "    Wiping internal VG cache", "    Wiping cache of LVM-capable devices", "    Test mode: Skipping archiving of volume group.", "    Resizing volume \"/dev/xvdg\" to 419430400 sectors.", "    Resizing physical volume /dev/xvdg from 2559 to 51199 extents.", "    Updating physical volume \"/dev/xvdg\"", "    Test mode: Skipping backup of volume group.", "    Test mode: Wiping internal cache", "    Wiping internal VG cache"], "stdout": "  Physical volume \"/dev/xvdg\" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized", "stdout_lines": ["  Physical volume \"/dev/xvdg\" changed", "  1 physical volume(s) resized / 0 physical volume(s) not resized"]}, "rc": 0, "start": "2018-07-10 18:38:58.096314", "stderr": "", "stderr_lines": [], "stdout": "  Physical volume \"/dev/xvdg\" changed\n  1 physical volume(s) resized / 0 physical volume(s) not resized", "stdout_lines": ["  Physical volume \"/dev/xvdg\" changed", "  1 physical volume(s) resized / 0 physical volume(s) not resized"]}
+TASK [Creating/extending logical volumes] **************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:45
+ok: [34.246.241.182] => (item={u'vg': u'vgdemo', u'name': u'lvconfig', u'size': u'1G'}) => {"changed": false, "failed": false, "item": {"name": "lvconfig", "size": "1G", "vg": "vgdemo"}, "lv": "lvconfig", "size": 1, "vg": "vgdemo"}
+changed: [34.246.241.182] => (item={u'vg': u'vgdemo', u'name': u'lvdata1', u'size': u'+20%FREE'}) => {"changed": true, "failed": false, "item": {"name": "lvdata1", "size": "+20%FREE", "vg": "vgdemo"}, "lv": "lvdata1", "size": 1840, "vg": "vgdemo"}
+changed: [34.246.241.182] => (item={u'vg': u'vgdemo', u'name': u'lvdata2', u'size': u'+100%FREE'}) => {"changed": true, "failed": false, "item": {"name": "lvdata2", "size": "+100%FREE", "vg": "vgdemo"}, "lv": "lvdata2", "size": 7372, "vg": "vgdemo"}
+TASK [Format filesystems] ******************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:57
+ok: [34.246.241.182] => (item={'value': {u'type': u'ext4', u'dev': u'/dev/vgdemo/lvconfig', u'opts': u''}, 'key': u'config'}) => {"changed": false, "failed": false, "item": {"key": "config", "value": {"dev": "/dev/vgdemo/lvconfig", "opts": "", "type": "ext4"}}, "msg": "ext4 filesystem is using the whole device /dev/vgdemo/lvconfig"}
+changed: [34.246.241.182] => (item={'value': {u'type': u'ext4', u'dev': u'/dev/vgdemo/lvdata1', u'opts': u''}, 'key': u'data1'}) => {"changed": true, "failed": false, "item": {"key": "data1", "value": {"dev": "/dev/vgdemo/lvdata1", "opts": "", "type": "ext4"}}, "msg": "Filesystem at /dev/vgdemo/lvdata1 is mounted on /mnt/data1; on-line resizing required\nold_desc_blocks = 1, new_desc_blocks = 5\nThe filesystem on /dev/vgdemo/lvdata1 is now 10432512 (4k) blocks long.\n\n"}
+changed: [34.246.241.182] => (item={'value': {u'type': u'ext4', u'dev': u'/dev/vgdemo/lvdata2', u'opts': u''}, 'key': u'data2'}) => {"changed": true, "failed": false, "item": {"key": "data2", "value": {"dev": "/dev/vgdemo/lvdata2", "opts": "", "type": "ext4"}}, "msg": "Filesystem at /dev/vgdemo/lvdata2 is mounted on /mnt/data2; on-line resizing required\nold_desc_blocks = 1, new_desc_blocks = 20\nThe filesystem on /dev/vgdemo/lvdata2 is now 41733120 (4k) blocks long.\n\n"}
+TASK [Mount filesystems] *******************************************************
+task path: /ansible/blog_automated_ebs_volumes.yml:68
+ok: [34.246.241.182] => (item={'value': {u'dump': u'0', u'passno': u'2', u'dev': u'/dev/vgdemo/lvconfig', u'fstype': u'ext4', u'state': u'mounted', u'mountpoint': u'/mnt/config', u'opts': u'noatime,nodiratime'}, 'key': u'config'}) => {"changed": false, "dump": "0", "failed": false, "fstab": "/etc/fstab", "fstype": "ext4", "item": {"key": "config", "value": {"dev": "/dev/vgdemo/lvconfig", "dump": "0", "fstype": "ext4", "mountpoint": "/mnt/config", "opts": "noatime,nodiratime", "passno": "2", "state": "mounted"}}, "name": "/mnt/config", "opts": "noatime,nodiratime", "passno": "2", "src": "/dev/vgdemo/lvconfig"}
+ok: [34.246.241.182] => (item={'value': {u'dump': u'0', u'passno': u'2', u'dev': u'/dev/vgdemo/lvdata1', u'fstype': u'ext4', u'state': u'mounted', u'mountpoint': u'/mnt/data1', u'opts': u'noatime,nodiratime'}, 'key': u'data1'}) => {"changed": false, "dump": "0", "failed": false, "fstab": "/etc/fstab", "fstype": "ext4", "item": {"key": "data1", "value": {"dev": "/dev/vgdemo/lvdata1", "dump": "0", "fstype": "ext4", "mountpoint": "/mnt/data1", "opts": "noatime,nodiratime", "passno": "2", "state": "mounted"}}, "name": "/mnt/data1", "opts": "noatime,nodiratime", "passno": "2", "src": "/dev/vgdemo/lvdata1"}
+ok: [34.246.241.182] => (item={'value': {u'dump': u'0', u'passno': u'2', u'dev': u'/dev/vgdemo/lvdata2', u'fstype': u'ext4', u'state': u'mounted', u'mountpoint': u'/mnt/data2', u'opts': u'noatime,nodiratime'}, 'key': u'data2'}) => {"changed": false, "dump": "0", "failed": false, "fstab": "/etc/fstab", "fstype": "ext4", "item": {"key": "data2", "value": {"dev": "/dev/vgdemo/lvdata2", "dump": "0", "fstype": "ext4", "mountpoint": "/mnt/data2", "opts": "noatime,nodiratime", "passno": "2", "state": "mounted"}}, "name": "/mnt/data2", "opts": "noatime,nodiratime", "passno": "2", "src": "/dev/vgdemo/lvdata2"}
+META: ran handlers
+META: ran handlers
+PLAY RECAP *********************************************************************
+34.246.241.182             : ok=8    changed=3    unreachable=0    failed=0
+We can see here that the LVM as well as filesystems were extended automatically.
+ubuntu@ip-10-0-1-130:~$ df -h
+Filesystem                   Size  Used Avail Use% Mounted on
+udev                         985M     0  985M   0% /dev
+tmpfs                        200M  740K  199M   1% /run
+/dev/xvda1                   7.7G  1.1G  6.7G  14% /
+tmpfs                        996M     0  996M   0% /dev/shm
+tmpfs                        5.0M     0  5.0M   0% /run/lock
+tmpfs                        996M     0  996M   0% /sys/fs/cgroup
+/dev/loop0                    87M   87M     0 100% /snap/core/4650
+/dev/loop1                    13M   13M     0 100% /snap/amazon-ssm-agent/295
+/dev/mapper/vgdemo-lvconfig  976M  2.6M  907M   1% /mnt/config
+/dev/mapper/vgdemo-lvdata1    40G   11M   38G   1% /mnt/data1
+/dev/mapper/vgdemo-lvdata2   157G   53M  151G   1% /mnt/data2
+tmpfs                        200M     0  200M   0% /run/user/1000
+Other Uses
+Of course you can split described Ansible playbook into multiple roles and have just one tag cherry pick the required tasks from multiple roles to extend drives. If you noticed, the playbook contains a tag that executes only required tasks for the second run resizefs . I have executed the entire playbook to show you how whole stdout from the playbook, but the same effect can be achieved with running with just resizefs tag. You can also execute Ansible playbook right from Terraform after provisioning extended drive, but that’s a topic for another time!
