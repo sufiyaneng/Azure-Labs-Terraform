@@ -5,7 +5,7 @@
 #Az ad signed -in-user show –output table (check ad users)
 #az login (login though portal)
 
-
+#save below file as main.tf
                                       #Script
 
 
@@ -67,3 +67,16 @@ resource "azurerm_windows_virtual_machine" "winvm0" {
     version   = "latest"
   }
 }
+
+
+
+# install terraform in windows URL:https://releases.hashicorp.com/terraform/1.1.7/terraform_1.1.7_windows_amd64.zip
+#unzip it on c:
+#open powershell and hit commands below
+#cd c:
+#terrafrom init   (initialize terraform)
+#terraform validate    (validation)
+#terraform show      (human-readable output from a state or plan file)
+#terraform plan     (creates an execution plan, which lets you preview the changes that Terraform plans to make to your infrastructure)
+#terraform apply    (apply changes to azure using terraform script create youre vm)
+#terraform Destroy     (destroy youre vm)
