@@ -2,7 +2,7 @@ provider "azurerm" {
   features {}
 }
 
-resource "azurerm_resource_group" "azvm-rg" {
+resource "azurerm_resource_group" "test-rg" {
   name     = "azvm-rg"
   location = "eastus"
 }
@@ -52,7 +52,7 @@ resource "azurerm_windows_virtual_machine" "winvm0" {
   source_image_reference {
     publisher = "MicrosoftWindowsServer"
     offer     = "WindowsServer"
-    sku       = "2019-Datacenter"
+    sku       = "2016-Datacenter"
     version   = "latest"
   }
 }
